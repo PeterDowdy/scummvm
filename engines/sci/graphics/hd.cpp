@@ -72,9 +72,13 @@ GfxHd *GfxHd::create() {
 #endif
 }
 
-GfxHd::GfxHd(const Common::FSNode &root, int scale) : _root(root), _scale(scale), _background(0) {
+GfxHd::GfxHd(const Common::FSNode &root, int scale) : _root(root), _scale(scale), _nextRecord(1), _background(0) {
 	indexFiles(root, "");
-	resetRecords();
+	HdRecord none = { nullptr, 0, 0, 0, 0, false };
+	_records.resize(0x10000);
+	for (auto &r : _records)
+		r = none;
+	_recordKeys.resize(0x10000);
 }
 
 GfxHd::~GfxHd() {
@@ -157,21 +161,15 @@ uint16 GfxHd::registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW
 		if (r.img == img && r.left == left && r.top == top && r.dstW == dstW && r.dstH == dstH && r.mirror == mirror)
 			return _recordIndex[key];
 	}
-	if (_records.size() >= 0xFFFF)
-		return 0;
+	const uint16 id = _nextRecord;
+	_nextRecord = _nextRecord == 0xFFFF ? 1 : _nextRecord + 1;
+	if (_records[id].img && _recordIndex.contains(_recordKeys[id]) && _recordIndex[_recordKeys[id]] == id)
+		_recordIndex.erase(_recordKeys[id]);
 	HdRecord r = { img, left, top, dstW, dstH, mirror };
-	_records.push_back(r);
-	const uint16 id = _records.size() - 1;
+	_records[id] = r;
+	_recordKeys[id] = key;
 	_recordIndex[key] = id;
 	return id;
-}
-
-void GfxHd::resetRecords() {
-	_records.clear();
-	_recordIndex.clear();
-	HdRecord none = { nullptr, 0, 0, 0, 0, false };
-	_records.push_back(none);
-	_background = 0;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -237,8 +235,8 @@ inline void putOut(byte *dst, const Graphics::PixelFormat &fmt, int r, int g, in
 
 } // End of anonymous namespace
 
-void GfxHd::compose(const byte *low, const uint16 *prov, int lowPitch, const Common::Rect &r, const byte *livePal,
-		byte *out, int outPitch, const Graphics::PixelFormat &fmt) const {
+void GfxHd::compose(const byte *low, const uint16 *prov, const int32 *shift, int lowPitch, const Common::Rect &r,
+		const byte *livePal, byte *out, int outPitch, const Graphics::PixelFormat &fmt) const {
 	const int n = _scale;
 	const int bpp = fmt.bytesPerPixel;
 	const HdRecord *bg = (_background && _background < _records.size()) ? &_records[_background] : nullptr;
@@ -259,13 +257,16 @@ void GfxHd::compose(const byte *low, const uint16 *prov, int lowPitch, const Com
 			}
 
 			const HdRecord &rec = _records[id];
+			// Sample where the pixel was drawn, which differs from where it is shown during scroll transitions
+			const int32 sh = shift[y * lowPitch + x];
+			const int sx = x + (int16)(sh & 0xFFFF), sy = y + (sh >> 16);
 			Grade grade;
 			grade.set(live, rec.img, idx);
-			const bool underlay = bg && bg != &rec && covers(*bg, x, y);
+			const bool underlay = bg && bg != &rec && covers(*bg, sx, sy);
 
 			for (int j = 0; j < n; j++) {
 				for (int i = 0; i < n; i++) {
-					const uint32 p = sample(rec, n, x, y, i, j);
+					const uint32 p = sample(rec, n, sx, sy, i, j);
 					const int a = p & 0xFF;
 					int cr, cg, cb;
 					grade.apply(p, cr, cg, cb);
@@ -274,7 +275,7 @@ void GfxHd::compose(const byte *low, const uint16 *prov, int lowPitch, const Com
 						// (graded like this pixel), else over the low-res colour
 						int ur = live[0], ug = live[1], ub = live[2];
 						if (underlay)
-							grade.apply(sample(*bg, n, x, y, i, j), ur, ug, ub);
+							grade.apply(sample(*bg, n, sx, sy, i, j), ur, ug, ub);
 						cr = (cr * a + ur * (255 - a)) / 255;
 						cg = (cg * a + ug * (255 - a)) / 255;
 						cb = (cb * a + ub * (255 - a)) / 255;
@@ -291,10 +292,11 @@ void GfxHd::compose(const byte *low, const uint16 *prov, int lowPitch, const Com
 
 HdGfxDriver::HdGfxDriver(GfxHd *hd, uint16 width, uint16 height) :
 	GfxDefaultDriver(width * hd->scale(), height * hd->scale(), false, true), _hd(hd), _n(hd->scale()),
-	_provSrc(nullptr), _currentProv(nullptr), _cursorBuffer(nullptr), _cursorBufferSize(0), _lastDump(0), _dumpInterval(0), _dumpCount(0) {
+	_provSrc(nullptr), _currentProv(nullptr), _currentShift(nullptr), _cursorBuffer(nullptr), _cursorBufferSize(0), _lastDump(0), _dumpInterval(0), _dumpCount(0) {
 	_virtualW = width;
 	_virtualH = height;
 	_currentProv = new uint16[width * height]();
+	_currentShift = new int32[width * height]();
 	if (ConfMan.hasKey("hd_dump_path")) {
 		_dumpPath = ConfMan.getPath("hd_dump_path");
 		_dumpInterval = ConfMan.hasKey("hd_dump_interval") ? ConfMan.getInt("hd_dump_interval") : 2000;
@@ -303,6 +305,7 @@ HdGfxDriver::HdGfxDriver(GfxHd *hd, uint16 width, uint16 height) :
 
 HdGfxDriver::~HdGfxDriver() {
 	delete[] _currentProv;
+	delete[] _currentShift;
 	delete[] _cursorBuffer;
 }
 
@@ -357,12 +360,18 @@ void HdGfxDriver::copyRectToScreen(const byte *src, int srcX, int srcY, int pitc
 	const byte *s = src + srcY * pitch + srcX;
 	if (s != _currentBitmap)
 		SciGfxDrvInternal::updateBitmapBuffer(_currentBitmap, _virtualW, s, pitch, destX, destY, w, h);
+	// Screen copies may land somewhere else than where they were drawn (scroll transitions): remember the
+	// displacement, packed as in GfxHd::compose, so HD art is sampled where the pixel came from
+	const int32 shift = (int32)(uint16)(int16)(srcX - destX) | (int32)((srcY - destY) * 65536);
 	for (int y = 0; y < h; y++) {
 		uint16 *d = _currentProv + (destY + y) * _virtualW + destX;
+		int32 *sh = _currentShift + (destY + y) * _virtualW + destX;
 		if (_provSrc)
 			memcpy(d, _provSrc + (srcY + y) * pitch + srcX, w * sizeof(uint16));
 		else
 			memset(d, 0, w * sizeof(uint16));
+		for (int x = 0; x < w; x++)
+			sh[x] = shift;
 	}
 	_provSrc = nullptr;
 
@@ -372,7 +381,7 @@ void HdGfxDriver::copyRectToScreen(const byte *src, int srcX, int srcY, int pitc
 void HdGfxDriver::present(const Common::Rect &r) {
 	const int outPitch = _screenW * _pixelSize;
 	const uint32 start = g_system->getMillis();
-	_hd->compose(_currentBitmap, _currentProv, _virtualW, r, _currentPalette, _compositeBuffer, outPitch, _format);
+	_hd->compose(_currentBitmap, _currentProv, _currentShift, _virtualW, r, _currentPalette, _compositeBuffer, outPitch, _format);
 	if (r.width() == _virtualW && r.height() == _virtualH)
 		debugC(1, kDebugLevelGraphics, "HD: full-screen compose took %u ms", g_system->getMillis() - start);
 	g_system->copyRectToScreen(_compositeBuffer + r.top * _n * outPitch + r.left * _n * _pixelSize, outPitch,

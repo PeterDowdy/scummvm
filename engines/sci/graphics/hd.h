@@ -83,17 +83,21 @@ public:
 	const HdImage *findView(int view, int loop, int cel);
 	const HdImage *findPic(int pic, int cel);
 
-	/** Returns a record id (>= 1), or 0 when the registry is full and must be reset first. */
+	/**
+	 * Returns a record id (>= 1). Ids live in a ring: an id is only reused after 65535 newer draws, so ids
+	 * still held by the displayed frame, saved screen bits or transition backups stay valid.
+	 */
 	uint16 registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror);
-	void resetRecords();
 	void setBackground(uint16 id) { _background = id; }
 
 	/**
 	 * Composite low-res rect `r` into the HD frame buffer `out` (full-size, pitch in bytes).
-	 * `low` and `prov` are full 320-wide planes with pitch `lowPitch` pixels.
+	 * `low`, `prov` and `shift` are full 320-wide planes with pitch `lowPitch` pixels. `shift` holds, per
+	 * displayed pixel, where it was drawn relative to where it is shown (screen copies to another position,
+	 * e.g. scroll transitions), packed as (dx & 0xFFFF) | dy << 16.
 	 */
-	void compose(const byte *low, const uint16 *prov, int lowPitch, const Common::Rect &r, const byte *livePal,
-		byte *out, int outPitch, const Graphics::PixelFormat &fmt) const;
+	void compose(const byte *low, const uint16 *prov, const int32 *shift, int lowPitch, const Common::Rect &r,
+		const byte *livePal, byte *out, int outPitch, const Graphics::PixelFormat &fmt) const;
 
 private:
 	GfxHd(const Common::FSNode &root, int scale);
@@ -104,7 +108,9 @@ private:
 	int _scale;
 	Common::HashMap<Common::String, bool> _files;           ///< every file in the pack, by relative path
 	Common::HashMap<Common::String, HdImage *> _images;     ///< loaded (or failed = nullptr) images
-	Common::Array<HdRecord> _records;                       ///< index 0 unused
+	Common::Array<HdRecord> _records;                       ///< ring of 65536 slots, index 0 unused
+	Common::Array<uint64> _recordKeys;                      ///< key of each slot, to drop it from the index on reuse
+	uint16 _nextRecord;
 	struct KeyHash { uint operator()(uint64 v) const { return (uint)(v ^ (v >> 32)); } };
 	Common::HashMap<uint64, uint16, KeyHash> _recordIndex;
 	uint16 _background;
@@ -137,6 +143,7 @@ private:
 	const int _n;
 	const uint16 *_provSrc;
 	uint16 *_currentProv;
+	int32 *_currentShift; ///< per displayed pixel: source position - displayed position (see GfxHd::compose)
 	byte *_cursorBuffer;
 	uint _cursorBufferSize;
 	Common::Path _dumpPath;

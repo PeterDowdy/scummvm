@@ -240,32 +240,20 @@ void GfxScreen::hdBeginView(int view, int loop, int cel, bool mirror, int16 left
 	if (!img)
 		return;
 	_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
-	if (!_hdCurrent) {
-		// Registry full: forget all draws (their pixels fall back to low-res until redrawn)
-		_hd->resetRecords();
-		memset(_provenanceScreen, 0, _pixels * sizeof(uint16));
-		_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
-	}
 }
 
 void GfxScreen::hdBeginPic(int pic, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH, bool background) {
 	_hdCurrent = 0;
 	if (!_hd || dstW <= 0 || dstH <= 0)
 		return;
-	if (background) {
-		// A new room picture replaces everything HD on screen: start a fresh registry
-		_hd->resetRecords();
-		memset(_provenanceScreen, 0, _pixels * sizeof(uint16));
-	}
+	if (background)
+		_hd->setBackground(0);
 	const HdImage *img = _hd->findPic(pic, cel);
+	debugC(1, kDebugLevelGraphics, "HD: pic %d.%d at (%d,%d) %dx%d%s%s%s", pic, cel, left, top, dstW, dstH,
+		mirror ? " mirrored" : "", background ? " background" : "", img ? "" : " (no HD)");
 	if (!img)
 		return;
 	_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
-	if (!_hdCurrent) {
-		_hd->resetRecords();
-		memset(_provenanceScreen, 0, _pixels * sizeof(uint16));
-		_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
-	}
 	if (background)
 		_hd->setBackground(_hdCurrent);
 }
