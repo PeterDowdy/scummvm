@@ -40,6 +40,7 @@ struct CelInfo {
 
 struct LoopInfo {
 	bool mirrorFlag;
+	int16 sourceLoop; ///< loop whose cel data this loop shows (itself unless it mirrors another loop)
 	Common::Array<CelInfo> cel;
 };
 

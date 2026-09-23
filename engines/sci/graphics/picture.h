@@ -84,6 +84,7 @@ private:
 	int _resourceType;
 
 	bool _mirroredFlag;
+	int _hdCelNo; ///< index of the next cel drawn by this picture (HD layer asset key)
 	bool _addToFlag;
 	int16 _EGApaletteNo;
 	byte _priority;

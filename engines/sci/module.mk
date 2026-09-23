@@ -61,6 +61,7 @@ MODULE_OBJS := \
 	graphics/remap.o \
 	graphics/scifont.o \
 	graphics/scifx.o \
+	graphics/hd.o \
 	graphics/screen.o \
 	graphics/text16.o \
 	graphics/transitions.o \

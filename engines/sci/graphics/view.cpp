@@ -182,6 +182,7 @@ void GfxView::initData() {
 			uint16 celCount = loopData.getUint16LEAt(0);
 			_loop[loopNo].cel.resize(celCount);
 			_loop[loopNo].mirrorFlag = mirrorBits & 1 ? true : false;
+			_loop[loopNo].sourceLoop = loopNo;
 			mirrorBits >>= 1;
 
 			// read cel info
@@ -276,6 +277,7 @@ void GfxView::initData() {
 			SciSpan<const byte> loopData = _resource->subspan(headerSize + (loopNo * loopSize));
 
 			byte seekEntry = loopData[0];
+			_loop[loopNo].sourceLoop = loopNo;
 			if (seekEntry != 255) {
 				_loop[loopNo].mirrorFlag = true;
 
@@ -284,6 +286,7 @@ void GfxView::initData() {
 				do {
 					if (seekEntry >= loopCount)
 						error("Bad loop-pointer in sci 1.1 view");
+					_loop[loopNo].sourceLoop = seekEntry;
 					loopData = _resource->subspan(headerSize + (seekEntry * loopSize));
 				} while ((seekEntry = loopData[0]) != 255);
 			} else {
@@ -833,6 +836,12 @@ void GfxView::draw(const Common::Rect &rect, const Common::Rect &clipRect, const
 		// upscaledHires means view is hires and needs no scaling
 		_screen->copyHiResRectToScreen(bitmapData, celWidth, clipRect.left, clipRect.top, width, height, palette->mapping);
 	} else {
+		if (_screen->hdActive()) {
+			// The full cel rect in screen space (before clipping), for the HD layer's sampling
+			const LoopInfo &loop = _loop[CLIP<int16>(loopNo, 0, _loop.size() - 1)];
+			_screen->hdBeginView(_resourceId, loop.sourceLoop, CLIP<int16>(celNo, 0, loop.cel.size() - 1), loop.mirrorFlag,
+				clipRectTranslated.left - (clipRect.left - rect.left), clipRectTranslated.top - (clipRect.top - rect.top), celWidth, celHeight);
+		}
 		for (int y = 0; y < height; y++, bitmapData += celWidth) {
 			for (int x = 0; x < width; x++) {
 				const byte color = bitmapData[x];
@@ -845,6 +854,7 @@ void GfxView::draw(const Common::Rect &rect, const Common::Rect &clipRect, const
 				}
 			}
 		}
+		_screen->hdEnd();
 	}
 
 	// Reset custom per-view palette mod
@@ -884,6 +894,11 @@ void GfxView::drawScaled(const Common::Rect &rect, const Common::Rect &clipRect,
 	const int16 offsetX = clipRect.left - rect.left;
 
 	const byte *bitmapData = bitmap.getUnsafeDataAt(0, celWidth * celHeight);
+	if (_screen->hdActive()) {
+		const LoopInfo &loop = _loop[CLIP<int16>(loopNo, 0, _loop.size() - 1)];
+		_screen->hdBeginView(_resourceId, loop.sourceLoop, CLIP<int16>(celNo, 0, loop.cel.size() - 1), loop.mirrorFlag,
+			clipRectTranslated.left - offsetX, clipRectTranslated.top - offsetY, (celWidth * scaleX) >> 7, (celHeight * scaleY) >> 7);
+	}
 	for (int y = 0; y < scaledHeight; y++) {
 		for (int x = 0; x < scaledWidth; x++) {
 			const byte color = bitmapData[scalingY[y + offsetY] * celWidth + scalingX[x + offsetX]];
@@ -894,6 +909,7 @@ void GfxView::drawScaled(const Common::Rect &rect, const Common::Rect &clipRect,
 			}
 		}
 	}
+	_screen->hdEnd();
 }
 
 void GfxView::createScalingTable(Common::Array<uint16> &table, int16 celSize, uint16 maxSize, int16 scale, bool mirrorFlag) {

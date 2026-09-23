@@ -58,6 +58,8 @@ enum {
 };
 
 class GfxDriver;
+class GfxHd;
+class HdGfxDriver;
 
 /**
  * Screen class, actually creates 3 (4) screens internally:
@@ -161,6 +163,19 @@ public:
 
 	GfxDriver *gfxDriver() const { return _gfxDrv; }
 
+	// HD presentation layer (see hd.h). All no-ops unless an HD pack is active.
+	bool hdActive() const { return _hd != nullptr; }
+	/** Following visual writes come from this view cel, whose full cel rect starts at left/top. */
+	void hdBeginView(int view, int loop, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH);
+	/** Following visual writes come from this pic cel; `background` = it starts a new room picture. */
+	void hdBeginPic(int pic, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH, bool background);
+	void hdEnd() { _hdCurrent = 0; }
+	/** Claim a pixel for the current HD draw without writing it (pic pixels equal to the cleared colour). */
+	void hdMarkPixel(int16 x, int16 y) {
+		if (_provenanceScreen)
+			_provenanceScreen[y * _width + x] = _hdCurrent;
+	}
+
 private:
 	uint16 _width;
 	uint16 _height;
@@ -216,6 +231,13 @@ private:
 
 	byte *_backupScreen; // for bak* functions
 
+	GfxHd *_hd;
+	HdGfxDriver *_hdDriver;
+	/** Per visual pixel: id of the HD draw record that last wrote it, 0 = none (see hd.h). */
+	uint16 *_provenanceScreen;
+	uint16 *_backupProvenance;
+	uint16 _hdCurrent;
+
 	void displayRect(const Common::Rect &rect, int x, int y);
 
 	ResourceManager *_resMan;
@@ -266,6 +288,8 @@ public:
 			_visualScreen[offset] = color;
 			if (_paletteMapScreen)
 				_paletteMapScreen[offset] = _curPaletteMapValue;
+			if (_provenanceScreen)
+				_provenanceScreen[offset] = _hdCurrent;
 
 			switch (_upscaledHires) {
 			case GFX_SCREEN_UPSCALED_DISABLED:
@@ -332,6 +356,8 @@ public:
 		if (drawMask & GFX_SCREEN_MASK_VISUAL) {
 			_visualScreen[offset] = color;
 			_displayScreen[offset] = color;
+			if (_provenanceScreen)
+				_provenanceScreen[offset] = _hdCurrent;
 			if (_paletteMapScreen)
 				_paletteMapScreen[offset] = _curPaletteMapValue;
 
@@ -392,6 +418,8 @@ public:
 			int offset = actualY * _width + x;
 
 			_visualScreen[offset] = color;
+			if (_provenanceScreen)
+				_provenanceScreen[offset] = _hdCurrent;
 			switch (_upscaledHires) {
 			case GFX_SCREEN_UPSCALED_DISABLED:
 				_displayScreen[offset] = color;

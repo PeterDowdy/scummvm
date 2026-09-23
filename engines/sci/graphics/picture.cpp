@@ -73,6 +73,7 @@ GuiResourceId GfxPicture::getResourceId() {
 void GfxPicture::draw(bool mirroredFlag, bool addToFlag, int16 EGApaletteNo) {
 	_mirroredFlag = mirroredFlag;
 	_addToFlag = addToFlag;
+	_hdCelNo = 0;
 	_EGApaletteNo = EGApaletteNo;
 	_priority = 0;
 
@@ -222,6 +223,12 @@ void GfxPicture::drawCelData(const SciSpan<const byte> &inbuffer, int headerPos,
 		ptr += skipCelBitmapPixels;
 		ptr += skipCelBitmapLines * width;
 
+		// HD layer: a pic drawn without addTo is a new room background. Its pixels equal to the (cleared-to)
+		// clear colour are skipped below, so they are claimed for the pic explicitly.
+		const bool hdMarkClear = _screen->hdActive() && !_addToFlag && !isEGA;
+		if (_screen->hdActive())
+			_screen->hdBeginPic(_resourceId, _hdCelNo, _mirroredFlag, leftX, y, width, height, !_addToFlag);
+
 		if ((!isEGA) || (priority < 16)) {
 			// VGA + EGA, EGA only checks priority, when given priority is below 16
 			if (!_mirroredFlag) {
@@ -231,6 +238,8 @@ void GfxPicture::drawCelData(const SciSpan<const byte> &inbuffer, int headerPos,
 					byte curByte = *ptr++;
 					if ((curByte != clearColor) && (priority >= _screen->getPriority(x, y)))
 						_screen->putPixel(x, y, drawMask, curByte, priority, 0);
+					else if (hdMarkClear && curByte == clearColor)
+						_screen->hdMarkPixel(x, y);
 
 					x++;
 
@@ -247,6 +256,8 @@ void GfxPicture::drawCelData(const SciSpan<const byte> &inbuffer, int headerPos,
 					byte curByte = *ptr++;
 					if ((curByte != clearColor) && (priority >= _screen->getPriority(x, y)))
 						_screen->putPixel(x, y, drawMask, curByte, priority, 0);
+					else if (hdMarkClear && curByte == clearColor)
+						_screen->hdMarkPixel(x, y);
 
 					if (x == leftX) {
 						ptr += sourcePixelSkipPerRow;
@@ -295,7 +306,9 @@ void GfxPicture::drawCelData(const SciSpan<const byte> &inbuffer, int headerPos,
 				}
 			}
 		}
+		_screen->hdEnd();
 	}
+	_hdCelNo++;
 }
 
 enum {

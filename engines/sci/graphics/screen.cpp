@@ -31,6 +31,7 @@
 #include "sci/sci.h"
 #include "sci/engine/state.h"
 #include "sci/graphics/screen.h"
+#include "sci/graphics/hd.h"
 #include "sci/graphics/view.h"
 #include "sci/graphics/palette16.h"
 #include "sci/graphics/scifx.h"
@@ -143,7 +144,20 @@ GfxScreen::GfxScreen(ResourceManager *resMan, Common::RenderMode renderMode) : _
 		}
 	}
 
-	_gfxDrv = SciGfxDriver::create(renderMode, _displayWidth, _displayHeight + extraHeight);
+	// HD presentation layer: SCI1.1 VGA games at their native display size only (see hd.h)
+	_hd = nullptr;
+	_hdDriver = nullptr;
+	_provenanceScreen = nullptr;
+	_backupProvenance = nullptr;
+	_hdCurrent = 0;
+	if (_upscaledHires == GFX_SCREEN_UPSCALED_DISABLED && !extraHeight && _resMan->getViewType() == kViewVga11)
+		_hd = GfxHd::create();
+
+	if (_hd) {
+		_gfxDrv = _hdDriver = new HdGfxDriver(_hd, _displayWidth, _displayHeight);
+	} else {
+		_gfxDrv = SciGfxDriver::create(renderMode, _displayWidth, _displayHeight + extraHeight);
+	}
 	assert(_gfxDrv);
 
 	// Buffer for rendering a single two-byte character
@@ -157,6 +171,8 @@ GfxScreen::GfxScreen(ResourceManager *resMan, Common::RenderMode renderMode) : _
 	_priorityScreen = (byte *)calloc(_pixels, 1);
 	_controlScreen = (byte *)calloc(_pixels, 1);
 	_displayScreen = (byte *)calloc(_displayPixels, 1);
+	if (_hd)
+		_provenanceScreen = (uint16 *)calloc(_pixels, sizeof(uint16));
 
 	// Create a Surface for _displayPixels so that we can draw to it from interfaces
 	// that only draw to Surfaces. Currently that's just Graphics::Font.
@@ -208,14 +224,57 @@ GfxScreen::~GfxScreen() {
 	free(_controlScreen);
 	free(_displayScreen);
 	free(_paletteMapScreen);
+	free(_provenanceScreen);
 	delete[] _backupScreen;
+	delete[] _backupProvenance;
 	delete[] _hiresGlyphBuffer;
 	delete _gfxDrv;
+	delete _hd;
+}
+
+void GfxScreen::hdBeginView(int view, int loop, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH) {
+	_hdCurrent = 0;
+	if (!_hd || dstW <= 0 || dstH <= 0)
+		return;
+	const HdImage *img = _hd->findView(view, loop, cel);
+	if (!img)
+		return;
+	_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
+	if (!_hdCurrent) {
+		// Registry full: forget all draws (their pixels fall back to low-res until redrawn)
+		_hd->resetRecords();
+		memset(_provenanceScreen, 0, _pixels * sizeof(uint16));
+		_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
+	}
+}
+
+void GfxScreen::hdBeginPic(int pic, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH, bool background) {
+	_hdCurrent = 0;
+	if (!_hd || dstW <= 0 || dstH <= 0)
+		return;
+	if (background) {
+		// A new room picture replaces everything HD on screen: start a fresh registry
+		_hd->resetRecords();
+		memset(_provenanceScreen, 0, _pixels * sizeof(uint16));
+	}
+	const HdImage *img = _hd->findPic(pic, cel);
+	if (!img)
+		return;
+	_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
+	if (!_hdCurrent) {
+		_hd->resetRecords();
+		memset(_provenanceScreen, 0, _pixels * sizeof(uint16));
+		_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
+	}
+	if (background)
+		_hd->setBackground(_hdCurrent);
 }
 
 void GfxScreen::displayRect(const Common::Rect &rect, int x, int y) {
 	// Display rect from _activeScreen to screen location x, y.
 	// Clipping is assumed to be done already.
+	if (_hdDriver)
+		_hdDriver->setProvenanceSource(_activeScreen == _displayScreen ? _provenanceScreen : nullptr);
 	_gfxDrv->copyRectToScreen(_activeScreen, rect.left, rect.top,
 		_displayWidth, x, y, rect.width(), rect.height(), _paletteModsEnabled ? _paletteMods : nullptr, _paletteMapScreen);
 }
@@ -228,6 +287,8 @@ void GfxScreen::clearForRestoreGame() {
 	memset(_priorityScreen, 0, _pixels);
 	memset(_controlScreen, 0, _pixels);
 	memset(_displayScreen, 0, _displayPixels);
+	if (_provenanceScreen)
+		memset(_provenanceScreen, 0, _pixels * sizeof(uint16));
 	memset(&_ditheredPicColors, 0, sizeof(_ditheredPicColors));
 	_fontIsUpscaled = false;
 	copyToScreen();
@@ -527,6 +588,8 @@ int GfxScreen::bitsGetDataSize(Common::Rect rect, byte mask) {
 			byteCount += pixels; // _displayScreen
 			if (_paletteMapScreen)
 				byteCount += pixels; // _paletteMapScreen
+			if (_provenanceScreen)
+				byteCount += pixels * sizeof(uint16); // _provenanceScreen
 		} else {
 			int rectHeight = _upscaledHeightMapping[rect.bottom] - _upscaledHeightMapping[rect.top];
 			int rectWidth = _upscaledWidthMapping[rect.right] - _upscaledWidthMapping[rect.left];
@@ -553,6 +616,12 @@ void GfxScreen::bitsSave(Common::Rect rect, byte mask, byte *memoryPtr) {
 		bitsSaveDisplayScreen(rect, _displayScreen, memoryPtr);
 		if (_paletteMapScreen)
 			bitsSaveDisplayScreen(rect, _paletteMapScreen, memoryPtr);
+		if (_provenanceScreen) {
+			for (int y = rect.top; y < rect.bottom; y++) {
+				memcpy(memoryPtr, _provenanceScreen + y * _width + rect.left, rect.width() * sizeof(uint16));
+				memoryPtr += rect.width() * sizeof(uint16);
+			}
+		}
 	}
 	if (mask & GFX_SCREEN_MASK_PRIORITY) {
 		bitsSaveScreen(rect, _priorityScreen, _width, memoryPtr);
@@ -610,6 +679,12 @@ void GfxScreen::bitsRestore(const byte *memoryPtr) {
 		bitsRestoreDisplayScreen(rect, memoryPtr, _displayScreen);
 		if (_paletteMapScreen)
 			bitsRestoreDisplayScreen(rect, memoryPtr, _paletteMapScreen);
+		if (_provenanceScreen) {
+			for (int y = rect.top; y < rect.bottom; y++) {
+				memcpy(_provenanceScreen + y * _width + rect.left, memoryPtr, rect.width() * sizeof(uint16));
+				memoryPtr += rect.width() * sizeof(uint16);
+			}
+		}
 	}
 	if (mask & GFX_SCREEN_MASK_PRIORITY) {
 		bitsRestoreScreen(rect, memoryPtr, _priorityScreen, _width);
@@ -914,16 +989,24 @@ void GfxScreen::bakCreateBackup() {
 	assert(!_backupScreen);
 	_backupScreen = new byte[_displayPixels];
 	_gfxDrv->copyCurrentBitmap(_backupScreen, _displayPixels);
+	if (_hdDriver) {
+		_backupProvenance = new uint16[_displayPixels];
+		_hdDriver->copyCurrentProvenance(_backupProvenance);
+	}
 }
 
 void GfxScreen::bakDiscard() {
 	assert(_backupScreen);
 	delete[] _backupScreen;
 	_backupScreen = nullptr;
+	delete[] _backupProvenance;
+	_backupProvenance = nullptr;
 }
 
 void GfxScreen::bakCopyRectToScreen(const Common::Rect &rect, int16 x, int16 y) {
 	assert(_backupScreen);
+	if (_hdDriver)
+		_hdDriver->setProvenanceSource(_backupProvenance);
 	_gfxDrv->copyRectToScreen(_backupScreen, rect.left, rect.top, _displayWidth, x, y, rect.width(), rect.height(), _paletteModsEnabled ? _paletteMods : nullptr, _paletteMapScreen);
 }
 
