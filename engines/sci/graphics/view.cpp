@@ -839,8 +839,10 @@ void GfxView::draw(const Common::Rect &rect, const Common::Rect &clipRect, const
 		if (_screen->hdActive()) {
 			// The full cel rect in screen space (before clipping), for the HD layer's sampling
 			const LoopInfo &loop = _loop[CLIP<int16>(loopNo, 0, _loop.size() - 1)];
+			// Anchor inside the drawn cel, as getCelRect places it (mirrored loops store displaceX negated)
 			_screen->hdBeginView(_resourceId, loop.sourceLoop, CLIP<int16>(celNo, 0, loop.cel.size() - 1), loop.mirrorFlag,
-				clipRectTranslated.left - (clipRect.left - rect.left), clipRectTranslated.top - (clipRect.top - rect.top), celWidth, celHeight);
+				clipRectTranslated.left - (clipRect.left - rect.left), clipRectTranslated.top - (clipRect.top - rect.top), celWidth, celHeight,
+				priority, (celWidth >> 1) - celInfo->displaceX, celHeight - celInfo->displaceY - 1, loop.cel.size());
 		}
 		for (int y = 0; y < height; y++, bitmapData += celWidth) {
 			for (int x = 0; x < width; x++) {
@@ -897,7 +899,8 @@ void GfxView::drawScaled(const Common::Rect &rect, const Common::Rect &clipRect,
 	if (_screen->hdActive()) {
 		const LoopInfo &loop = _loop[CLIP<int16>(loopNo, 0, _loop.size() - 1)];
 		_screen->hdBeginView(_resourceId, loop.sourceLoop, CLIP<int16>(celNo, 0, loop.cel.size() - 1), loop.mirrorFlag,
-			clipRectTranslated.left - offsetX, clipRectTranslated.top - offsetY, (celWidth * scaleX) >> 7, (celHeight * scaleY) >> 7);
+			clipRectTranslated.left - offsetX, clipRectTranslated.top - offsetY, (celWidth * scaleX) >> 7, (celHeight * scaleY) >> 7,
+			priority, 0, 0, loop.cel.size(), true);
 	}
 	for (int y = 0; y < scaledHeight; y++) {
 		for (int x = 0; x < scaledWidth; x++) {

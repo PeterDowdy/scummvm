@@ -52,6 +52,16 @@ namespace Sci {
  *   view/<view>/palette.pal       768-byte RGB reference palette
  *   pic/<pic>.<cel>.png           RGBA background
  *   pic/<pic>.pal                 768-byte RGB reference palette
+ *   view/<view>/tweens.json       in-between frames: {"<loop>.<cel>": [{"pos", "file", "w", "h", "ox", "oy"}]},
+ *                                 drawn between that cel and the next one; w/h/ox/oy (size and anchor) in
+ *                                 low-res pixels, "file" relative to the pack
+ *
+ * In-betweens: an actor (a cast member drawn by GfxAnimate) whose view has in-betweens is an *overlay*.
+ * Its low-res pixels show the HD background, and its whole HD frame is drawn on top, hidden where the
+ * priority screen puts something in front and never over pixels no HD draw owns (text, windows). The frame
+ * runs one cel behind the game: after a cel change, the cel's display time shows the previous cel, then each
+ * in-between in turn, while the actor eases from its old position to its new one. Nothing is predicted, so
+ * stops, turns and loop changes can't show a wrong frame; the cost is one cel of visual latency.
  */
 
 struct HdImage {
@@ -70,6 +80,47 @@ struct HdRecord {
 	int16 dstW;
 	int16 dstH;
 	bool mirror;
+	bool overlay; ///< an actor drawn as an overlay (see above): its pixels show the background
+};
+
+/** An in-between frame from a view's tweens.json. */
+struct HdTween {
+	float pos;       ///< 0-1: how far from its cel to the next one
+	int16 w, h;      ///< size in low-res pixels
+	int16 ox, oy;    ///< anchor inside the frame (unmirrored), low-res pixels
+	Common::String file;
+};
+
+/** What the HD layer knows about one animated actor (a cast object). */
+struct HdActor {
+	int view = -1, loop = -1, cel = -1, cels = 0;
+	bool mirror = false;
+	int16 ax = 0, ay = 0;          ///< anchor on screen (low-res)
+	int16 celW = 0, celH = 0;      ///< the drawn cel's size
+	int16 celAx = 0, celAy = 0;    ///< anchor inside the drawn cel
+	byte priority = 0;
+	uint16 record = 0;             ///< the record of its latest draw
+	// The cel before the latest change, which the frame is still moving away from
+	bool hasPrev = false;
+	int prevCel = -1;
+	int16 prevAx = 0, prevAy = 0, prevW = 0, prevH = 0, prevCelAx = 0, prevCelAy = 0;
+	uint32 changedAt = 0;          ///< when the cel last changed (ms)
+	uint32 period = 0;             ///< time between cel changes (ms), smoothed
+	// What the screen shows now, to redraw only on change
+	int shownKey = -3;
+	int shownX = 0, shownY = 0;
+	Common::Rect shownRect;
+};
+
+/** The frame an overlay actor shows at some moment. */
+struct HdOverlayFrame {
+	const HdImage *img;
+	int16 w, h;        ///< size in low-res pixels
+	int16 ox, oy;      ///< anchor inside the frame as drawn (mirrored when flipped)
+	bool flip;
+	int hdX, hdY;      ///< anchor on the HD screen
+	int key;           ///< which frame: -1 the current cel, -2 the previous cel, >= 0 an in-between
+	Common::Rect lowRect() const;
 };
 
 class GfxHd {
@@ -87,8 +138,25 @@ public:
 	 * Returns a record id (>= 1). Ids live in a ring: an id is only reused after 65535 newer draws, so ids
 	 * still held by the displayed frame, saved screen bits or transition backups stay valid.
 	 */
-	uint16 registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror);
+	uint16 registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror, bool overlay = false);
 	void setBackground(uint16 id) { _background = id; }
+	bool isOverlay(uint16 id) const { return id && _records[id].overlay; }
+
+	// In-betweens (see above)
+	bool tweensEnabled() const { return _tweensEnabled; }
+	bool hasTweens(int view);
+	/** An actor was drawn with this cel at this place; tracks its cel changes and their timing. */
+	void noteActor(uint32 actor, const HdActor &drawn);
+	Common::HashMap<uint32, HdActor> &actors() { return _actors; }
+	/** The frame ``a`` shows at ``now`` (ms). False when there's no HD image for it. */
+	bool actorFrame(const HdActor &a, uint32 now, HdOverlayFrame &f);
+	/**
+	 * Draw an overlay frame into the HD frame buffer within low-res rect ``clip``. ``priority`` is the low-res
+	 * priority screen; the frame is hidden where it holds something in front of the actor.
+	 */
+	void drawOverlay(const HdOverlayFrame &f, byte priority, uint16 record, const byte *low, const uint16 *prov,
+		const byte *priScreen, int lowPitch, const Common::Rect &clip, const byte *livePal, byte *out, int outPitch,
+		const Graphics::PixelFormat &fmt) const;
 
 	/**
 	 * Composite low-res rect `r` into the HD frame buffer `out` (full-size, pitch in bytes).
@@ -102,6 +170,8 @@ public:
 private:
 	GfxHd(const Common::FSNode &root, int scale);
 	const HdImage *load(const Common::String &path, const Common::String &palPath);
+	const Common::Array<HdTween> *tweens(int view, int loop, int cel);
+	void loadTweens(int view);
 	void indexFiles(const Common::FSNode &dir, const Common::String &prefix);
 
 	Common::FSNode _root;
@@ -114,6 +184,9 @@ private:
 	struct KeyHash { uint operator()(uint64 v) const { return (uint)(v ^ (v >> 32)); } };
 	Common::HashMap<uint64, uint16, KeyHash> _recordIndex;
 	uint16 _background;
+	bool _tweensEnabled;
+	Common::HashMap<int, Common::HashMap<Common::String, Common::Array<HdTween> > > _tweens; ///< view -> "loop.cel"
+	Common::HashMap<uint32, HdActor> _actors;
 };
 
 /** Presents the game at N x its resolution in true colour, compositing HD assets via GfxHd. */
@@ -134,14 +207,21 @@ public:
 	/** Provenance plane (same layout as the src of the next copyRectToScreen), or nullptr for none. */
 	void setProvenanceSource(const uint16 *prov) { _provSrc = prov; }
 	void copyCurrentProvenance(uint16 *dest) const;
+	/** The low-res priority screen, for hiding overlay frames behind what's in front of them. */
+	void setPriorityScreen(const byte *priority) { _priority = priority; }
+	/** Called often (60 fps): redraw overlay actors whose frame or position has moved on. */
+	void tick();
 
 private:
 	void present(const Common::Rect &r);
 	void dumpFrame();
+	/** Overlay actors the displayed frame holds, lowest priority first. */
+	void visibleActors(Common::Array<uint32> &out);
 
 	GfxHd *_hd;
 	const int _n;
 	const uint16 *_provSrc;
+	const byte *_priority;
 	uint16 *_currentProv;
 	int32 *_currentShift; ///< per displayed pixel: source position - displayed position (see GfxHd::compose)
 	byte *_cursorBuffer;

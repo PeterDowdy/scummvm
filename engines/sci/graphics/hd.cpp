@@ -19,6 +19,7 @@
  *
  */
 
+#include "common/algorithm.h"
 #include "common/config-manager.h"
 #include "common/file.h"
 #include "common/formats/json.h"
@@ -74,7 +75,8 @@ GfxHd *GfxHd::create() {
 
 GfxHd::GfxHd(const Common::FSNode &root, int scale) : _root(root), _scale(scale), _nextRecord(1), _background(0) {
 	indexFiles(root, "");
-	HdRecord none = { nullptr, 0, 0, 0, 0, false };
+	_tweensEnabled = !ConfMan.hasKey("hd_tweens") || ConfMan.getBool("hd_tweens");
+	HdRecord none = { nullptr, 0, 0, 0, 0, false, false };
 	_records.resize(0x10000);
 	for (auto &r : _records)
 		r = none;
@@ -152,24 +154,173 @@ const HdImage *GfxHd::load(const Common::String &path, const Common::String &pal
 	return img;
 }
 
-uint16 GfxHd::registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror) {
+uint16 GfxHd::registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror, bool overlay) {
 	// Pack the draw into a key; images are identified by their record-independent address
 	const uint64 key = ((uint64)(uintptr)img << 32) ^ ((uint64)(uint16)left << 20) ^ ((uint64)(uint16)top << 8)
-		^ ((uint64)dstW << 40) ^ ((uint64)dstH << 52) ^ (mirror ? 1ULL << 63 : 0);
+		^ ((uint64)dstW << 40) ^ ((uint64)dstH << 52) ^ (mirror ? 1ULL << 63 : 0) ^ (overlay ? 1ULL << 62 : 0);
 	if (_recordIndex.contains(key)) {
 		const HdRecord &r = _records[_recordIndex[key]];
-		if (r.img == img && r.left == left && r.top == top && r.dstW == dstW && r.dstH == dstH && r.mirror == mirror)
+		if (r.img == img && r.left == left && r.top == top && r.dstW == dstW && r.dstH == dstH && r.mirror == mirror
+				&& r.overlay == overlay)
 			return _recordIndex[key];
 	}
 	const uint16 id = _nextRecord;
 	_nextRecord = _nextRecord == 0xFFFF ? 1 : _nextRecord + 1;
 	if (_records[id].img && _recordIndex.contains(_recordKeys[id]) && _recordIndex[_recordKeys[id]] == id)
 		_recordIndex.erase(_recordKeys[id]);
-	HdRecord r = { img, left, top, dstW, dstH, mirror };
+	HdRecord r = { img, left, top, dstW, dstH, mirror, overlay };
 	_records[id] = r;
 	_recordKeys[id] = key;
 	_recordIndex[key] = id;
 	return id;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// In-betweens and actors
+
+bool GfxHd::hasTweens(int view) {
+	if (!_tweensEnabled)
+		return false;
+	loadTweens(view);
+	return !_tweens[view].empty();
+}
+
+void GfxHd::loadTweens(int view) {
+	if (_tweens.contains(view))
+		return;
+	Common::HashMap<Common::String, Common::Array<HdTween> > &byCel = _tweens[view];
+	const Common::String path = Common::String::format("view/%d/tweens.json", view);
+	if (!_files.contains(path))
+		return;
+	Common::FSNode node = _root;
+	for (const auto &part : Common::Path(path).splitComponents())
+		node = node.getChild(part);
+	Common::SeekableReadStream *s = node.createReadStream();
+	if (!s)
+		return;
+	Common::String text = s->readString(0, s->size());
+	delete s;
+	Common::JSONValue *v = Common::JSON::parse(text);
+	if (!v || !v->isObject()) {
+		warning("HD pack: bad %s", path.c_str());
+		delete v;
+		return;
+	}
+	for (const auto &cel : v->asObject()) {
+		if (!cel._value->isArray())
+			continue;
+		Common::Array<HdTween> &list = byCel[cel._key];
+		for (const Common::JSONValue *t : cel._value->asArray()) {
+			if (!t->isObject() || !t->hasChild("file"))
+				continue;
+			HdTween tw;
+			tw.pos = (float)t->asObject()["pos"]->asNumber();
+			tw.w = (int16)t->asObject()["w"]->asIntegerNumber();
+			tw.h = (int16)t->asObject()["h"]->asIntegerNumber();
+			tw.ox = (int16)t->asObject()["ox"]->asIntegerNumber();
+			tw.oy = (int16)t->asObject()["oy"]->asIntegerNumber();
+			tw.file = t->asObject()["file"]->asString();
+			list.push_back(tw);
+		}
+		Common::sort(list.begin(), list.end(), [](const HdTween &a, const HdTween &b) { return a.pos < b.pos; });
+	}
+	delete v;
+	debug("HD pack: view %d has in-betweens for %u cels", view, byCel.size());
+}
+
+const Common::Array<HdTween> *GfxHd::tweens(int view, int loop, int cel) {
+	loadTweens(view);
+	const Common::String key = Common::String::format("%d.%d", loop, cel);
+	return _tweens[view].contains(key) ? &_tweens[view][key] : nullptr;
+}
+
+void GfxHd::noteActor(uint32 actor, const HdActor &drawn) {
+	const uint32 now = g_system->getMillis();
+	HdActor &a = _actors[actor];
+	const bool sameLoop = a.view == drawn.view && a.loop == drawn.loop && a.mirror == drawn.mirror;
+	if (sameLoop && a.cel != drawn.cel) {
+		const uint32 interval = now - a.changedAt;
+		if (interval > 0 && interval < 1000)
+			a.period = a.period ? (a.period + interval) / 2 : interval;
+		// A jump (teleport, room change) isn't a step: don't ease across it
+		a.hasPrev = ABS(drawn.ax - a.ax) <= 8 && ABS(drawn.ay - a.ay) <= 8;
+		a.prevCel = a.cel;
+		a.prevAx = a.ax;
+		a.prevAy = a.ay;
+		a.prevW = a.celW;
+		a.prevH = a.celH;
+		a.prevCelAx = a.celAx;
+		a.prevCelAy = a.celAy;
+		a.changedAt = now;
+	} else if (!sameLoop) {
+		a.hasPrev = false;
+		a.changedAt = now;
+	}
+	a.view = drawn.view;
+	a.loop = drawn.loop;
+	a.cel = drawn.cel;
+	a.cels = drawn.cels;
+	a.mirror = drawn.mirror;
+	a.ax = drawn.ax;
+	a.ay = drawn.ay;
+	a.celW = drawn.celW;
+	a.celH = drawn.celH;
+	a.celAx = drawn.celAx;
+	a.celAy = drawn.celAy;
+	a.priority = drawn.priority;
+	a.record = drawn.record;
+}
+
+bool GfxHd::actorFrame(const HdActor &a, uint32 now, HdOverlayFrame &f) {
+	const int n = _scale;
+	f.flip = a.mirror;
+	f.img = findView(a.view, a.loop, a.cel);
+	f.w = a.celW;
+	f.h = a.celH;
+	f.ox = a.celAx;
+	f.oy = a.celAy;
+	f.hdX = a.ax * n;
+	f.hdY = a.ay * n;
+	f.key = -1;
+	const float t = a.period ? (float)(now - a.changedAt) / a.period : 1.0f;
+	if (!a.hasPrev || t >= 1.0f || a.cels < 2 || (a.prevCel + 1) % a.cels != a.cel)
+		return f.img != nullptr;
+
+	// Between the previous cel and this one: ease the position, and show the latest in-between reached
+	f.hdX = (int)((a.prevAx + (a.ax - a.prevAx) * t) * n + 0.5f);
+	f.hdY = (int)((a.prevAy + (a.ay - a.prevAy) * t) * n + 0.5f);
+	const Common::Array<HdTween> *list = tweens(a.view, a.loop, a.prevCel);
+	int k = -1;
+	if (list) {
+		for (uint i = 0; i < list->size(); i++) {
+			if ((*list)[i].pos <= t)
+				k = i;
+		}
+	}
+	if (k < 0) {
+		const HdImage *prev = findView(a.view, a.loop, a.prevCel);
+		if (prev) {
+			f.img = prev;
+			f.w = a.prevW;
+			f.h = a.prevH;
+			f.ox = a.prevCelAx;
+			f.oy = a.prevCelAy;
+			f.key = -2;
+		}
+	} else {
+		const HdTween &tw = (*list)[k];
+		const HdImage *img = load(tw.file, Common::String::format("view/%d/palette.pal", a.view));
+		if (img) {
+			f.img = img;
+			f.w = tw.w;
+			f.h = tw.h;
+			// Mirrored loops flip the frame around the same anchor rule the engine uses for cels
+			f.ox = a.mirror ? (int16)(((tw.w >> 1) << 1) - tw.ox) : tw.ox;
+			f.oy = tw.oy;
+			f.key = k;
+		}
+	}
+	return f.img != nullptr;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -260,6 +411,21 @@ void GfxHd::compose(const byte *low, const uint16 *prov, const int32 *shift, int
 			// Sample where the pixel was drawn, which differs from where it is shown during scroll transitions
 			const int32 sh = shift[y * lowPitch + x];
 			const int sx = x + (int16)(sh & 0xFFFF), sy = y + (sh >> 16);
+
+			if (rec.overlay) {
+				// An overlay actor's own pixels: the HD background shows here, the actor is drawn on top later
+				for (int j = 0; j < n; j++) {
+					for (int i = 0; i < n; i++) {
+						int cr = live[0], cg = live[1], cb = live[2];
+						if (bg && covers(*bg, sx, sy)) {
+							const uint32 p = sample(*bg, n, sx, sy, i, j);
+							cr = (p >> 24) & 0xFF; cg = (p >> 16) & 0xFF; cb = (p >> 8) & 0xFF;
+						}
+						putOut(block + j * outPitch + i * bpp, fmt, cr, cg, cb);
+					}
+				}
+				continue;
+			}
 			Grade grade;
 			grade.set(live, rec.img, idx);
 			const bool underlay = bg && bg != &rec && covers(*bg, sx, sy);
@@ -287,12 +453,61 @@ void GfxHd::compose(const byte *low, const uint16 *prov, const int32 *shift, int
 	}
 }
 
+void GfxHd::drawOverlay(const HdOverlayFrame &f, byte priority, uint16 record, const byte *low, const uint16 *prov,
+		const byte *priScreen, int lowPitch, const Common::Rect &clip, const byte *livePal, byte *out, int outPitch,
+		const Graphics::PixelFormat &fmt) const {
+	const int n = _scale;
+	const int bpp = fmt.bytesPerPixel;
+	const int x0 = f.hdX - f.ox * n, y0 = f.hdY - f.oy * n;
+	const int w = f.w * n, h = f.h * n;
+	const int cx0 = MAX(x0, clip.left * n), cy0 = MAX(y0, clip.top * n);
+	const int cx1 = MIN(x0 + w, clip.right * n), cy1 = MIN(y0 + h, clip.bottom * n);
+	const HdImage *img = f.img;
+	for (int hy = cy0; hy < cy1; hy++) {
+		const int ly = hy / n;
+		int iy = (hy - y0) * img->h / h;
+		iy = CLIP<int>(iy, 0, img->h - 1);
+		for (int hx = cx0; hx < cx1; hx++) {
+			const int lx = hx / n;
+			const int o = ly * lowPitch + lx;
+			const uint16 id = prov[o];
+			// Visible where the actor itself drew, or over another HD draw that isn't in front of it.
+			// Pixels no HD draw owns (text, windows, the status line) always stay on top.
+			if (id != record && (!id || id >= _records.size() || priScreen[o] > priority))
+				continue;
+			int ix = (hx - x0) * img->w / w;
+			ix = CLIP<int>(ix, 0, img->w - 1);
+			if (f.flip)
+				ix = img->w - 1 - ix;
+			const uint32 p = img->px[iy * img->w + ix];
+			const int a = p & 0xFF;
+			if (!a)
+				continue;
+			// Grade by whatever palette entry is under this pixel against the frame's reference palette
+			Grade grade;
+			grade.set(&livePal[low[o] * 3], img, low[o]);
+			int cr, cg, cb;
+			grade.apply(p, cr, cg, cb);
+			byte *dst = out + hy * outPitch + hx * bpp;
+			if (a < 255) {
+				const uint32 cur = bpp == 4 ? *(uint32 *)dst : *(uint16 *)dst;
+				byte ur, ug, ub;
+				fmt.colorToRGB(cur, ur, ug, ub);
+				cr = (cr * a + ur * (255 - a)) / 255;
+				cg = (cg * a + ug * (255 - a)) / 255;
+				cb = (cb * a + ub * (255 - a)) / 255;
+			}
+			putOut(dst, fmt, cr, cg, cb);
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Driver
 
 HdGfxDriver::HdGfxDriver(GfxHd *hd, uint16 width, uint16 height) :
 	GfxDefaultDriver(width * hd->scale(), height * hd->scale(), false, true), _hd(hd), _n(hd->scale()),
-	_provSrc(nullptr), _currentProv(nullptr), _currentShift(nullptr), _cursorBuffer(nullptr), _cursorBufferSize(0), _lastDump(0), _dumpInterval(0), _dumpCount(0) {
+	_provSrc(nullptr), _priority(nullptr), _currentProv(nullptr), _currentShift(nullptr), _cursorBuffer(nullptr), _cursorBufferSize(0), _lastDump(0), _dumpInterval(0), _dumpCount(0) {
 	_virtualW = width;
 	_virtualH = height;
 	_currentProv = new uint16[width * height]();
@@ -378,10 +593,76 @@ void HdGfxDriver::copyRectToScreen(const byte *src, int srcX, int srcY, int pitc
 	present(Common::Rect(destX, destY, destX + w, destY + h));
 }
 
-void HdGfxDriver::present(const Common::Rect &r) {
+static Common::Rect frameRect(const HdOverlayFrame &f, int n) {
+	// Low-res pixels the frame touches
+	const int x0 = f.hdX - f.ox * n, y0 = f.hdY - f.oy * n;
+	return Common::Rect(x0 / n, y0 / n, (x0 + f.w * n + n - 1) / n, (y0 + f.h * n + n - 1) / n);
+}
+
+void HdGfxDriver::visibleActors(Common::Array<uint32> &out) {
+	out.clear();
+	Common::HashMap<uint32, HdActor> &actors = _hd->actors();
+	if (actors.empty())
+		return;
+	// Records the displayed frame holds (an actor's latest draw may not be on screen yet)
+	Common::HashMap<uint16, bool> shown;
+	const uint16 *p = _currentProv, *end = _currentProv + _virtualW * _virtualH;
+	for (; p < end; p++) {
+		if (*p && _hd->isOverlay(*p))
+			shown[*p] = true;
+	}
+	for (auto &a : actors) {
+		if (shown.contains(a._value.record))
+			out.push_back(a._key);
+	}
+	Common::sort(out.begin(), out.end(), [&actors](uint32 a, uint32 b) { return actors[a].priority < actors[b].priority; });
+}
+
+void HdGfxDriver::present(const Common::Rect &dirty) {
 	const int outPitch = _screenW * _pixelSize;
 	const uint32 start = g_system->getMillis();
+	Common::Rect r = dirty;
+
+	// Overlay actors draw beyond their low-res pixels: recompose all of any one the update touches
+	Common::Array<uint32> ids;
+	visibleActors(ids);
+	Common::Array<HdOverlayFrame> frames(ids.size());
+	Common::Array<bool> have(ids.size());
+	for (uint i = 0; i < ids.size(); i++)
+		have[i] = _priority && _hd->actorFrame(_hd->actors()[ids[i]], start, frames[i]);
+	const Common::Rect screen(_virtualW, _virtualH);
+	for (int pass = 0; pass < 3; pass++) {
+		const Common::Rect before = r;
+		for (uint i = 0; i < ids.size(); i++) {
+			HdActor &a = _hd->actors()[ids[i]];
+			if (!a.shownRect.isEmpty() && a.shownRect.intersects(r))
+				r.extend(a.shownRect);
+			if (have[i]) {
+				const Common::Rect fr = frameRect(frames[i], _n);
+				if (fr.intersects(r))
+					r.extend(fr);
+			}
+		}
+		r.clip(screen);
+		if (r == before)
+			break;
+	}
+
 	_hd->compose(_currentBitmap, _currentProv, _currentShift, _virtualW, r, _currentPalette, _compositeBuffer, outPitch, _format);
+	for (uint i = 0; i < ids.size(); i++) {
+		HdActor &a = _hd->actors()[ids[i]];
+		if (!have[i])
+			continue;
+		const Common::Rect fr = frameRect(frames[i], _n);
+		if (!fr.intersects(r))
+			continue;
+		_hd->drawOverlay(frames[i], a.priority, a.record, _currentBitmap, _currentProv, _priority, _virtualW, r,
+			_currentPalette, _compositeBuffer, outPitch, _format);
+		a.shownKey = frames[i].key;
+		a.shownX = frames[i].hdX;
+		a.shownY = frames[i].hdY;
+		a.shownRect = fr;
+	}
 	if (r.width() == _virtualW && r.height() == _virtualH)
 		debugC(1, kDebugLevelGraphics, "HD: full-screen compose took %u ms", g_system->getMillis() - start);
 	g_system->copyRectToScreen(_compositeBuffer + r.top * _n * outPitch + r.left * _n * _pixelSize, outPitch,
@@ -391,6 +672,32 @@ void HdGfxDriver::present(const Common::Rect &r) {
 		_lastDump = g_system->getMillis();
 		dumpFrame();
 	}
+}
+
+void HdGfxDriver::tick() {
+	if (!_ready || !_priority || _hd->actors().empty())
+		return;
+	const uint32 now = g_system->getMillis();
+	Common::Array<uint32> ids;
+	visibleActors(ids);
+	Common::Rect dirty;
+	for (uint32 id : ids) {
+		HdActor &a = _hd->actors()[id];
+		HdOverlayFrame f;
+		if (!_hd->actorFrame(a, now, f))
+			continue;
+		if (f.key == a.shownKey && f.hdX == a.shownX && f.hdY == a.shownY)
+			continue;
+		Common::Rect r = frameRect(f, _n);
+		if (!a.shownRect.isEmpty())
+			r.extend(a.shownRect);
+		if (dirty.isEmpty())
+			dirty = r;
+		else
+			dirty.extend(r);
+	}
+	if (!dirty.isEmpty())
+		present(dirty);
 }
 
 void HdGfxDriver::copyCurrentProvenance(uint16 *dest) const {

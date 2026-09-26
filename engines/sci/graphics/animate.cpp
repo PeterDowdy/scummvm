@@ -44,6 +44,11 @@
 
 namespace Sci {
 
+/** Identifies a cast object to the HD layer's in-between tracking. */
+static uint32 hdActorKey(reg_t object) {
+	return ((uint32)object.getSegment() << 16) | (object.getOffset() & 0xFFFF);
+}
+
 GfxAnimate::GfxAnimate(EngineState *state, ScriptPatcher *scriptPatcher, GfxCache *cache, GfxCompare *compare, GfxPorts *ports, GfxPaint16 *paint16, GfxScreen *screen, GfxPalette *palette, GfxCursor *cursor, GfxTransitions *transitions)
 	: _s(state), _scriptPatcher(scriptPatcher), _cache(cache), _compare(compare), _ports(ports), _paint16(paint16), _screen(screen), _palette(palette), _cursor(cursor), _transitions(transitions) {
 	init();
@@ -414,7 +419,9 @@ void GfxAnimate::update() {
 	for (it = _list.begin(); it != end; ++it) {
 		if (it->signal & kSignalAlwaysUpdate) {
 			// draw corresponding cel
+			_screen->hdSetActor(hdActorKey(it->object));
 			_paint16->drawCel(it->viewId, it->loopNo, it->celNo, it->celRect, it->priority, it->paletteNo, it->scaleX, it->scaleY);
+			_screen->hdSetActor(0);
 			it->showBitsFlag = true;
 
 			it->signal &= ~(kSignalStopUpdate | kSignalViewUpdated | kSignalNoUpdate | kSignalForceUpdate);
@@ -446,7 +453,9 @@ void GfxAnimate::update() {
 	for (it = _list.begin(); it != end; ++it) {
 		if (it->signal & kSignalNoUpdate && !(it->signal & kSignalHidden)) {
 			// draw corresponding cel
+			_screen->hdSetActor(hdActorKey(it->object));
 			_paint16->drawCel(it->viewId, it->loopNo, it->celNo, it->celRect, it->priority, it->paletteNo, it->scaleX, it->scaleY);
+			_screen->hdSetActor(0);
 			it->showBitsFlag = true;
 
 			if (!(it->signal & kSignalIgnoreActor)) {
@@ -471,7 +480,9 @@ void GfxAnimate::drawCels() {
 			writeSelector(_s->_segMan, it->object, SELECTOR(underBits), bitsHandle);
 
 			// draw corresponding cel
+			_screen->hdSetActor(hdActorKey(it->object));
 			_paint16->drawCel(it->viewId, it->loopNo, it->celNo, it->celRect, it->priority, it->paletteNo, it->scaleX, it->scaleY, it->scaleSignal);
+			_screen->hdSetActor(0);
 			it->showBitsFlag = true;
 
 			if (it->signal & kSignalRemoveView)
@@ -558,7 +569,9 @@ void GfxAnimate::reAnimate(Common::Rect rect) {
 		AnimateArray::iterator end = _lastCastData.end();
 		for (it = _lastCastData.begin(); it != end; ++it) {
 			it->castHandle = _paint16->bitsSave(it->celRect, GFX_SCREEN_MASK_VISUAL|GFX_SCREEN_MASK_PRIORITY);
+			_screen->hdSetActor(hdActorKey(it->object));
 			_paint16->drawCel(it->viewId, it->loopNo, it->celNo, it->celRect, it->priority, it->paletteNo, it->scaleX, it->scaleY);
+			_screen->hdSetActor(0);
 		}
 		_paint16->bitsShow(rect);
 		// restoring

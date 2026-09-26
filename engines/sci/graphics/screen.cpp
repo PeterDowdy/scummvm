@@ -150,6 +150,7 @@ GfxScreen::GfxScreen(ResourceManager *resMan, Common::RenderMode renderMode) : _
 	_provenanceScreen = nullptr;
 	_backupProvenance = nullptr;
 	_hdCurrent = 0;
+	_hdActor = 0;
 	if (_upscaledHires == GFX_SCREEN_UPSCALED_DISABLED && !extraHeight && _resMan->getViewType() == kViewVga11)
 		_hd = GfxHd::create();
 
@@ -171,8 +172,10 @@ GfxScreen::GfxScreen(ResourceManager *resMan, Common::RenderMode renderMode) : _
 	_priorityScreen = (byte *)calloc(_pixels, 1);
 	_controlScreen = (byte *)calloc(_pixels, 1);
 	_displayScreen = (byte *)calloc(_displayPixels, 1);
-	if (_hd)
+	if (_hd) {
 		_provenanceScreen = (uint16 *)calloc(_pixels, sizeof(uint16));
+		_hdDriver->setPriorityScreen(_priorityScreen);
+	}
 
 	// Create a Surface for _displayPixels so that we can draw to it from interfaces
 	// that only draw to Surfaces. Currently that's just Graphics::Font.
@@ -232,14 +235,38 @@ GfxScreen::~GfxScreen() {
 	delete _hd;
 }
 
-void GfxScreen::hdBeginView(int view, int loop, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH) {
+void GfxScreen::hdBeginView(int view, int loop, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH,
+		byte priority, int16 celAx, int16 celAy, int cels, bool scaled) {
 	_hdCurrent = 0;
 	if (!_hd || dstW <= 0 || dstH <= 0)
 		return;
 	const HdImage *img = _hd->findView(view, loop, cel);
 	if (!img)
 		return;
-	_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror);
+	const bool overlay = _hdActor && !scaled && _hd->hasTweens(view);
+	_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror, overlay);
+	if (overlay) {
+		HdActor drawn;
+		drawn.view = view;
+		drawn.loop = loop;
+		drawn.cel = cel;
+		drawn.cels = cels;
+		drawn.mirror = mirror;
+		drawn.ax = left + celAx;
+		drawn.ay = top + celAy;
+		drawn.celW = dstW;
+		drawn.celH = dstH;
+		drawn.celAx = celAx;
+		drawn.celAy = celAy;
+		drawn.priority = priority;
+		drawn.record = _hdCurrent;
+		_hd->noteActor(_hdActor, drawn);
+	}
+}
+
+void GfxScreen::hdTick() {
+	if (_hdDriver)
+		_hdDriver->tick();
 }
 
 void GfxScreen::hdBeginPic(int pic, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH, bool background) {
