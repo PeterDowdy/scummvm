@@ -463,6 +463,44 @@ void GfxHd::drawOverlay(const HdOverlayFrame &f, byte priority, uint16 record, c
 	const int cx0 = MAX(x0, clip.left * n), cy0 = MAX(y0, clip.top * n);
 	const int cx1 = MIN(x0 + w, clip.right * n), cy1 = MIN(y0 + h, clip.bottom * n);
 	const HdImage *img = f.img;
+
+	// Grade the whole frame like the actor's own low-res pixels (fades, tints): pixels outside its current
+	// outline sit over the background, whose palette entries say nothing about the actor's colours
+	Grade grade;
+	grade.identity = true;
+	{
+		int sum[3] = { 0, 0, 0 }, add[3] = { 0, 0, 0 }, count = 0;
+		Common::Rect own(x0 / n, y0 / n, (x0 + w) / n, (y0 + h) / n);
+		own.clip(clip); // the presented region, which the driver grows to hold every overlay frame it touches
+		for (int ly = own.top; ly < own.bottom; ly++) {
+			for (int lx = own.left; lx < own.right; lx++) {
+				const int o = ly * lowPitch + lx;
+				if (prov[o] != record)
+					continue;
+				Grade g;
+				g.set(&livePal[low[o] * 3], img, low[o]);
+				for (int c = 0; c < 3; c++) {
+					sum[c] += g.mul[c] >> 8;
+					add[c] += g.add[c];
+				}
+				count++;
+			}
+		}
+		if (count) {
+			for (int c = 0; c < 3; c++) {
+				grade.mul[c] = (sum[c] / count) << 8;
+				grade.add[c] = add[c] / count;
+				if (grade.mul[c] != 1 << 16 || grade.add[c])
+					grade.identity = false;
+			}
+		} else {
+			for (int c = 0; c < 3; c++) {
+				grade.mul[c] = 1 << 16;
+				grade.add[c] = 0;
+			}
+		}
+	}
+
 	for (int hy = cy0; hy < cy1; hy++) {
 		const int ly = hy / n;
 		int iy = (hy - y0) * img->h / h;
@@ -483,9 +521,6 @@ void GfxHd::drawOverlay(const HdOverlayFrame &f, byte priority, uint16 record, c
 			const int a = p & 0xFF;
 			if (!a)
 				continue;
-			// Grade by whatever palette entry is under this pixel against the frame's reference palette
-			Grade grade;
-			grade.set(&livePal[low[o] * 3], img, low[o]);
 			int cr, cg, cb;
 			grade.apply(p, cr, cg, cb);
 			byte *dst = out + hy * outPitch + hx * bpp;
@@ -631,6 +666,14 @@ void HdGfxDriver::present(const Common::Rect &dirty) {
 	for (uint i = 0; i < ids.size(); i++)
 		have[i] = _priority && _hd->actorFrame(_hd->actors()[ids[i]], start, frames[i]);
 	const Common::Rect screen(_virtualW, _virtualH);
+	// Frames still showing for actors the displayed frame no longer holds (stopped: another view; turned;
+	// hidden; gone) are erased when an update touches them
+	for (auto &a : _hd->actors()) {
+		if (a._value.shownRect.isEmpty() || Common::find(ids.begin(), ids.end(), a._key) != ids.end())
+			continue;
+		if (a._value.shownRect.intersects(r))
+			r.extend(a._value.shownRect);
+	}
 	for (int pass = 0; pass < 3; pass++) {
 		const Common::Rect before = r;
 		for (uint i = 0; i < ids.size(); i++) {
@@ -649,6 +692,13 @@ void HdGfxDriver::present(const Common::Rect &dirty) {
 	}
 
 	_hd->compose(_currentBitmap, _currentProv, _currentShift, _virtualW, r, _currentPalette, _compositeBuffer, outPitch, _format);
+	for (auto &a : _hd->actors()) {
+		if (!a._value.shownRect.isEmpty() && r.contains(a._value.shownRect)
+				&& Common::find(ids.begin(), ids.end(), a._key) == ids.end()) {
+			a._value.shownRect = Common::Rect();  // erased by the compose above
+			a._value.shownKey = -3;
+		}
+	}
 	for (uint i = 0; i < ids.size(); i++) {
 		HdActor &a = _hd->actors()[ids[i]];
 		if (!have[i])
@@ -681,6 +731,14 @@ void HdGfxDriver::tick() {
 	Common::Array<uint32> ids;
 	visibleActors(ids);
 	Common::Rect dirty;
+	for (auto &a : _hd->actors()) {
+		if (a._value.shownRect.isEmpty() || Common::find(ids.begin(), ids.end(), a._key) != ids.end())
+			continue;
+		if (dirty.isEmpty())
+			dirty = a._value.shownRect;
+		else
+			dirty.extend(a._value.shownRect);
+	}
 	for (uint32 id : ids) {
 		HdActor &a = _hd->actors()[id];
 		HdOverlayFrame f;
