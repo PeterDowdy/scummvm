@@ -240,6 +240,12 @@ void GfxScreen::hdBeginView(int view, int loop, int cel, bool mirror, int16 left
 	_hdCurrent = 0;
 	if (!_hd || dstW <= 0 || dstH <= 0)
 		return;
+	// Talker portraits (drawn with DrawCel, not as actors) may have a full-face animation (see hd.h)
+	if (!_hdActor && !scaled && !mirror && _hd->hasFace(view)) {
+		_hdCurrent = _hd->noteFaceDraw(view, loop, cel, left, top, dstW, dstH);
+		if (_hdCurrent)
+			return;
+	}
 	const HdImage *img = _hd->findView(view, loop, cel);
 	if (!img)
 		return;

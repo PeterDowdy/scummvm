@@ -56,6 +56,18 @@ namespace Sci {
  *                                 drawn between that cel and the next one; w/h/ox/oy (size and anchor) in
  *                                 low-res pixels, "file" relative to the pack
  *
+ *   view/<view>/face.json         full-face animation for a talker portrait (see below):
+ *                                 {"talk": {"fps": F, "frames": [file, ...]}, "idle": {...}, "eyes": {"<cel>": file},
+ *                                  "loops": {"bust": 0, "mouth": 1, "eyes": 2}, "hold": ms}
+ *
+ * Faces: a talker portrait (Talker.sc) is one view drawn as a bust, with the mouth and eyes redrawn on top as
+ * separate small cels: the mouth cycles random cels while text is up, the eyes blink. With a face.json the
+ * mouth and eye draws inside the bust count as the bust, and the whole bust shows a full-face frame instead:
+ * the "talk" loop in order while the mouth is moving (or for "hold" ms after it last moved), else "idle" (or
+ * the bust's HD image). While the eyes show a cel other than 0, "eyes" layers that cel's image (RGBA, bust
+ * size, transparent outside the eyes) on top. Frames are sampled over the bust like any cel; files are
+ * relative to the pack.
+ *
  * In-betweens: an actor (a cast member drawn by GfxAnimate) whose view has in-betweens is an *overlay*.
  * Its low-res pixels show the HD background, and its whole HD frame is drawn on top, hidden where the
  * priority screen puts something in front and never over pixels no HD draw owns (text, windows). The frame
@@ -81,6 +93,33 @@ struct HdRecord {
 	int16 dstH;
 	bool mirror;
 	bool overlay; ///< an actor drawn as an overlay (see above): its pixels show the background
+	int16 face;   ///< a talker bust with a face.json: index into GfxHd's faces, else -1
+};
+
+/** A looping sequence of face frames. */
+struct HdFaceAnim {
+	Common::Array<Common::String> frames;
+	float fps = 12.0f;
+};
+
+/** A talker portrait with a full-face animation (see above). */
+struct HdFace {
+	int view = -1;
+	int bustLoop = 0, mouthLoop = 1, eyesLoop = 2;
+	HdFaceAnim talk, idle;
+	Common::HashMap<int, Common::String> eyes; ///< eye cel -> layer file
+	uint32 holdMs = 400;
+	// State
+	uint16 record = 0;            ///< the latest bust draw
+	int mouthCel = 0;
+	uint32 mouthAt = 0;           ///< when the mouth was last drawn with another cel
+	int eyesCel = 0;
+	bool talking = false;
+	uint32 since = 0;             ///< when the current animation (talk or idle) started
+	int key = -1;                 ///< the frame chosen by the last update
+	int shownKey = -2;            ///< the frame on screen
+	const HdImage *base = nullptr;
+	const HdImage *layer = nullptr;
 };
 
 /** An in-between frame from a view's tweens.json. */
@@ -142,6 +181,19 @@ public:
 	void setBackground(uint16 id) { _background = id; }
 	bool isOverlay(uint16 id) const { return id && _records[id].overlay; }
 
+	// Faces (see above)
+	/**
+	 * A cel of a view with a face.json was drawn (not by an actor). Returns the record its pixels belong to:
+	 * a bust draw gets a new face record, a mouth or eye draw inside the latest bust gets that bust's record;
+	 * 0 when it isn't part of a face.
+	 */
+	uint16 noteFaceDraw(int view, int loop, int cel, int16 left, int16 top, int16 dstW, int16 dstH);
+	bool hasFace(int view);
+	/** Choose every face's frame for ``now`` (ms). */
+	void updateFaces(uint32 now);
+	Common::Array<HdFace> &faces() { return _faces; }
+	const HdRecord &record(uint16 id) const { return _records[id]; }
+
 	// In-betweens (see above)
 	bool tweensEnabled() const { return _tweensEnabled; }
 	bool hasTweens(int view);
@@ -172,6 +224,7 @@ private:
 	const HdImage *load(const Common::String &path, const Common::String &palPath);
 	const Common::Array<HdTween> *tweens(int view, int loop, int cel);
 	void loadTweens(int view);
+	int loadFace(int view);
 	void indexFiles(const Common::FSNode &dir, const Common::String &prefix);
 
 	Common::FSNode _root;
@@ -187,6 +240,9 @@ private:
 	bool _tweensEnabled;
 	Common::HashMap<int, Common::HashMap<Common::String, Common::Array<HdTween> > > _tweens; ///< view -> "loop.cel"
 	Common::HashMap<uint32, HdActor> _actors;
+	bool _facesEnabled;
+	Common::HashMap<int, int> _faceIndex; ///< view -> index into _faces, or -1 for none
+	Common::Array<HdFace> _faces;
 };
 
 /** Presents the game at N x its resolution in true colour, compositing HD assets via GfxHd. */
@@ -215,6 +271,8 @@ public:
 private:
 	void present(const Common::Rect &r);
 	void dumpFrame();
+	/** Grow ``r`` to whole faces whose frame changed, so a face never shows two frames at once. */
+	void extendFaces(Common::Rect &r);
 	/** Overlay actors the displayed frame holds, lowest priority first. */
 	void visibleActors(Common::Array<uint32> &out);
 

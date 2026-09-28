@@ -76,7 +76,8 @@ GfxHd *GfxHd::create() {
 GfxHd::GfxHd(const Common::FSNode &root, int scale) : _root(root), _scale(scale), _nextRecord(1), _background(0) {
 	indexFiles(root, "");
 	_tweensEnabled = !ConfMan.hasKey("hd_tweens") || ConfMan.getBool("hd_tweens");
-	HdRecord none = { nullptr, 0, 0, 0, 0, false, false };
+	_facesEnabled = !ConfMan.hasKey("hd_faces") || ConfMan.getBool("hd_faces");
+	HdRecord none = { nullptr, 0, 0, 0, 0, false, false, -1 };
 	_records.resize(0x10000);
 	for (auto &r : _records)
 		r = none;
@@ -168,11 +169,151 @@ uint16 GfxHd::registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW
 	_nextRecord = _nextRecord == 0xFFFF ? 1 : _nextRecord + 1;
 	if (_records[id].img && _recordIndex.contains(_recordKeys[id]) && _recordIndex[_recordKeys[id]] == id)
 		_recordIndex.erase(_recordKeys[id]);
-	HdRecord r = { img, left, top, dstW, dstH, mirror, overlay };
+	HdRecord r = { img, left, top, dstW, dstH, mirror, overlay, -1 };
 	_records[id] = r;
 	_recordKeys[id] = key;
 	_recordIndex[key] = id;
 	return id;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Faces
+
+bool GfxHd::hasFace(int view) {
+	return _facesEnabled && loadFace(view) >= 0;
+}
+
+static void readAnim(const Common::JSONValue *v, HdFaceAnim &anim) {
+	if (!v || !v->isObject())
+		return;
+	const Common::JSONObject &o = v->asObject();
+	if (o.contains("fps") && o["fps"]->isNumber())
+		anim.fps = MAX<float>(0.1f, (float)o["fps"]->asNumber());
+	else if (o.contains("fps") && o["fps"]->isIntegerNumber())
+		anim.fps = MAX<float>(0.1f, (float)o["fps"]->asIntegerNumber());
+	if (o.contains("frames") && o["frames"]->isArray()) {
+		for (const Common::JSONValue *f : o["frames"]->asArray()) {
+			if (f->isString())
+				anim.frames.push_back(f->asString());
+		}
+	}
+}
+
+int GfxHd::loadFace(int view) {
+	if (_faceIndex.contains(view))
+		return _faceIndex[view];
+	_faceIndex[view] = -1;
+	const Common::String path = Common::String::format("view/%d/face.json", view);
+	if (!_files.contains(path))
+		return -1;
+	Common::FSNode node = _root;
+	for (const auto &part : Common::Path(path).splitComponents())
+		node = node.getChild(part);
+	Common::SeekableReadStream *s = node.createReadStream();
+	if (!s)
+		return -1;
+	Common::String text = s->readString(0, s->size());
+	delete s;
+	Common::JSONValue *v = Common::JSON::parse(text);
+	if (!v || !v->isObject()) {
+		warning("HD pack: bad %s", path.c_str());
+		delete v;
+		return -1;
+	}
+	const Common::JSONObject &o = v->asObject();
+	HdFace face;
+	face.view = view;
+	if (o.contains("talk"))
+		readAnim(o["talk"], face.talk);
+	if (o.contains("idle"))
+		readAnim(o["idle"], face.idle);
+	if (o.contains("eyes") && o["eyes"]->isObject()) {
+		for (const auto &e : o["eyes"]->asObject()) {
+			if (e._value->isString())
+				face.eyes[(int)e._key.asUint64()] = e._value->asString();
+		}
+	}
+	if (o.contains("loops") && o["loops"]->isObject()) {
+		const Common::JSONObject &l = o["loops"]->asObject();
+		if (l.contains("bust") && l["bust"]->isIntegerNumber())
+			face.bustLoop = (int)l["bust"]->asIntegerNumber();
+		if (l.contains("mouth") && l["mouth"]->isIntegerNumber())
+			face.mouthLoop = (int)l["mouth"]->asIntegerNumber();
+		if (l.contains("eyes") && l["eyes"]->isIntegerNumber())
+			face.eyesLoop = (int)l["eyes"]->asIntegerNumber();
+	}
+	if (o.contains("hold") && o["hold"]->isIntegerNumber())
+		face.holdMs = (uint32)o["hold"]->asIntegerNumber();
+	delete v;
+	_faces.push_back(face);
+	_faceIndex[view] = _faces.size() - 1;
+	debug("HD pack: view %d has a face: %u talk, %u idle frames, %u eye layers", view, face.talk.frames.size(),
+		face.idle.frames.size(), face.eyes.size());
+	return _faceIndex[view];
+}
+
+uint16 GfxHd::noteFaceDraw(int view, int loop, int cel, int16 left, int16 top, int16 dstW, int16 dstH) {
+	const int idx = _facesEnabled ? loadFace(view) : -1;
+	if (idx < 0)
+		return 0;
+	HdFace &f = _faces[idx];
+	const Common::String pal = Common::String::format("view/%d/palette.pal", view);
+	if (loop == f.bustLoop) {
+		const HdImage *img = findView(view, loop, cel);
+		if (!img && !f.idle.frames.empty())
+			img = load(f.idle.frames[0], pal);
+		if (!img && !f.talk.frames.empty())
+			img = load(f.talk.frames[0], pal);
+		if (!img)
+			return 0;
+		const uint16 id = registerDraw(img, left, top, dstW, dstH, false);
+		_records[id].face = idx;
+		f.record = id;
+		return id;
+	}
+	if ((loop != f.mouthLoop && loop != f.eyesLoop) || !f.record)
+		return 0;
+	// Only inside the bust it belongs to (the view might be drawn elsewhere too)
+	const HdRecord &bust = _records[f.record];
+	if (bust.face != idx || left < bust.left || top < bust.top || left + dstW > bust.left + bust.dstW
+			|| top + dstH > bust.top + bust.dstH)
+		return 0;
+	if (loop == f.mouthLoop) {
+		if (cel != f.mouthCel) {
+			f.mouthCel = cel;
+			f.mouthAt = g_system->getMillis();
+		}
+	} else {
+		f.eyesCel = cel;
+	}
+	return f.record;
+}
+
+void GfxHd::updateFaces(uint32 now) {
+	for (uint i = 0; i < _faces.size(); i++) {
+		HdFace &f = _faces[i];
+		if (!f.record || _records[f.record].face != (int16)i)
+			continue;
+		const bool talking = f.mouthCel != 0 || (f.mouthAt && now - f.mouthAt < f.holdMs);
+		if (talking != f.talking || !f.since) {
+			f.talking = talking;
+			f.since = now;
+		}
+		const HdFaceAnim &anim = talking ? f.talk : f.idle;
+		const Common::String pal = Common::String::format("view/%d/palette.pal", f.view);
+		int frame = 999;
+		f.base = nullptr;
+		if (!anim.frames.empty()) {
+			frame = (int)((uint64)(now - f.since) * (uint64)(anim.fps * 1000) / 1000000 % anim.frames.size());
+			f.base = load(anim.frames[frame], pal);
+		}
+		if (!f.base)
+			f.base = _records[f.record].img;
+		f.layer = nullptr;
+		if (f.eyesCel && f.eyes.contains(f.eyesCel))
+			f.layer = load(f.eyes[f.eyesCel], pal);
+		f.key = (talking ? 1000 : 2000) + frame + (f.layer ? f.eyesCel * 10000 : 0);
+	}
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -407,7 +548,15 @@ void GfxHd::compose(const byte *low, const uint16 *prov, const int32 *shift, int
 				continue;
 			}
 
-			const HdRecord &rec = _records[id];
+			HdRecord rec = _records[id];
+			// A talker bust shows its face's current frame, with the eye layer on top (see hd.h)
+			const HdImage *layer = nullptr;
+			if (rec.face >= 0) {
+				const HdFace &f = _faces[rec.face];
+				if (f.base)
+					rec.img = f.base;
+				layer = f.layer;
+			}
 			// Sample where the pixel was drawn, which differs from where it is shown during scroll transitions
 			const int32 sh = shift[y * lowPitch + x];
 			const int sx = x + (int16)(sh & 0xFFFF), sy = y + (sh >> 16);
@@ -445,6 +594,19 @@ void GfxHd::compose(const byte *low, const uint16 *prov, const int32 *shift, int
 						cr = (cr * a + ur * (255 - a)) / 255;
 						cg = (cg * a + ug * (255 - a)) / 255;
 						cb = (cb * a + ub * (255 - a)) / 255;
+					}
+					if (layer) {
+						HdRecord lrec = rec;
+						lrec.img = layer;
+						const uint32 lp = sample(lrec, n, sx, sy, i, j);
+						const int la = lp & 0xFF;
+						if (la) {
+							int lr, lg, lb;
+							grade.apply(lp, lr, lg, lb);
+							cr = (lr * la + cr * (255 - la)) / 255;
+							cg = (lg * la + cg * (255 - la)) / 255;
+							cb = (lb * la + cb * (255 - la)) / 255;
+						}
 					}
 					putOut(block + j * outPitch + i * bpp, fmt, cr, cg, cb);
 				}
@@ -657,6 +819,8 @@ void HdGfxDriver::present(const Common::Rect &dirty) {
 	const int outPitch = _screenW * _pixelSize;
 	const uint32 start = g_system->getMillis();
 	Common::Rect r = dirty;
+	_hd->updateFaces(start);
+	extendFaces(r);
 
 	// Overlay actors draw beyond their low-res pixels: recompose all of any one the update touches
 	Common::Array<uint32> ids;
@@ -692,6 +856,15 @@ void HdGfxDriver::present(const Common::Rect &dirty) {
 	}
 
 	_hd->compose(_currentBitmap, _currentProv, _currentShift, _virtualW, r, _currentPalette, _compositeBuffer, outPitch, _format);
+	for (HdFace &f : _hd->faces()) {
+		if (!f.record)
+			continue;
+		const HdRecord &b = _hd->record(f.record);
+		Common::Rect fr(b.left, b.top, b.left + b.dstW, b.top + b.dstH);
+		fr.clip(screen);
+		if (r.contains(fr))
+			f.shownKey = f.key;
+	}
 	for (auto &a : _hd->actors()) {
 		if (!a._value.shownRect.isEmpty() && r.contains(a._value.shownRect)
 				&& Common::find(ids.begin(), ids.end(), a._key) == ids.end()) {
@@ -724,35 +897,80 @@ void HdGfxDriver::present(const Common::Rect &dirty) {
 	}
 }
 
+void HdGfxDriver::extendFaces(Common::Rect &r) {
+	const Common::Rect screen(_virtualW, _virtualH);
+	for (const HdFace &f : _hd->faces()) {
+		if (!f.record || f.key == f.shownKey)
+			continue;
+		const HdRecord &b = _hd->record(f.record);
+		Common::Rect fr(b.left, b.top, b.left + b.dstW, b.top + b.dstH);
+		fr.clip(screen);
+		if (!fr.isEmpty() && fr.intersects(r))
+			r.extend(fr);
+	}
+}
+
 void HdGfxDriver::tick() {
-	if (!_ready || !_priority || _hd->actors().empty())
+	if (!_ready)
 		return;
 	const uint32 now = g_system->getMillis();
-	Common::Array<uint32> ids;
-	visibleActors(ids);
 	Common::Rect dirty;
-	for (auto &a : _hd->actors()) {
-		if (a._value.shownRect.isEmpty() || Common::find(ids.begin(), ids.end(), a._key) != ids.end())
-			continue;
-		if (dirty.isEmpty())
-			dirty = a._value.shownRect;
-		else
-			dirty.extend(a._value.shownRect);
+	const Common::Rect screen(_virtualW, _virtualH);
+
+	// Faces whose frame moved on, if the displayed frame holds them
+	if (!_hd->faces().empty()) {
+		_hd->updateFaces(now);
+		for (const HdFace &f : _hd->faces()) {
+			if (!f.record || f.key == f.shownKey)
+				continue;
+			const HdRecord &b = _hd->record(f.record);
+			Common::Rect fr(b.left, b.top, b.left + b.dstW, b.top + b.dstH);
+			fr.clip(screen);
+			bool shown = false;
+			for (int y = fr.top; y < fr.bottom && !shown; y++) {
+				const uint16 *p = _currentProv + y * _virtualW;
+				for (int x = fr.left; x < fr.right; x++) {
+					if (p[x] == f.record) {
+						shown = true;
+						break;
+					}
+				}
+			}
+			if (!shown || fr.isEmpty())
+				continue;
+			if (dirty.isEmpty())
+				dirty = fr;
+			else
+				dirty.extend(fr);
+		}
 	}
-	for (uint32 id : ids) {
-		HdActor &a = _hd->actors()[id];
-		HdOverlayFrame f;
-		if (!_hd->actorFrame(a, now, f))
-			continue;
-		if (f.key == a.shownKey && f.hdX == a.shownX && f.hdY == a.shownY)
-			continue;
-		Common::Rect r = frameRect(f, _n);
-		if (!a.shownRect.isEmpty())
-			r.extend(a.shownRect);
-		if (dirty.isEmpty())
-			dirty = r;
-		else
-			dirty.extend(r);
+
+	if (_priority && !_hd->actors().empty()) {
+		Common::Array<uint32> ids;
+		visibleActors(ids);
+		for (auto &a : _hd->actors()) {
+			if (a._value.shownRect.isEmpty() || Common::find(ids.begin(), ids.end(), a._key) != ids.end())
+				continue;
+			if (dirty.isEmpty())
+				dirty = a._value.shownRect;
+			else
+				dirty.extend(a._value.shownRect);
+		}
+		for (uint32 id : ids) {
+			HdActor &a = _hd->actors()[id];
+			HdOverlayFrame f;
+			if (!_hd->actorFrame(a, now, f))
+				continue;
+			if (f.key == a.shownKey && f.hdX == a.shownX && f.hdY == a.shownY)
+				continue;
+			Common::Rect r = frameRect(f, _n);
+			if (!a.shownRect.isEmpty())
+				r.extend(a.shownRect);
+			if (dirty.isEmpty())
+				dirty = r;
+			else
+				dirty.extend(r);
+		}
 	}
 	if (!dirty.isEmpty())
 		present(dirty);
