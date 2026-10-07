@@ -286,6 +286,7 @@ private:
 	uint _cursorBufferSize;
 	Common::Path _dumpPath;
 	uint32 _lastDump;
+	bool _dumpPending; ///< a present was skipped by the dump interval; dump it once the interval is over
 	uint32 _dumpInterval;
 	int _dumpCount;
 };
