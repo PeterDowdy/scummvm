@@ -704,7 +704,7 @@ void GfxHd::drawOverlay(const HdOverlayFrame &f, byte priority, uint16 record, c
 
 HdGfxDriver::HdGfxDriver(GfxHd *hd, uint16 width, uint16 height) :
 	GfxDefaultDriver(width * hd->scale(), height * hd->scale(), false, true), _hd(hd), _n(hd->scale()),
-	_provSrc(nullptr), _priority(nullptr), _currentProv(nullptr), _currentShift(nullptr), _cursorBuffer(nullptr), _cursorBufferSize(0), _lastDump(0), _dumpInterval(0), _dumpCount(0) {
+	_provSrc(nullptr), _priority(nullptr), _currentProv(nullptr), _currentShift(nullptr), _cursorBuffer(nullptr), _cursorBufferSize(0), _lastDump(0), _dumpPending(false), _dumpInterval(0), _dumpCount(0) {
 	_virtualW = width;
 	_virtualH = height;
 	_currentProv = new uint16[width * height]();
@@ -891,9 +891,14 @@ void HdGfxDriver::present(const Common::Rect &dirty) {
 	g_system->copyRectToScreen(_compositeBuffer + r.top * _n * outPitch + r.left * _n * _pixelSize, outPitch,
 		r.left * _n, r.top * _n, r.width() * _n, r.height() * _n);
 
-	if (_dumpInterval && g_system->getMillis() - _lastDump >= _dumpInterval) {
-		_lastDump = g_system->getMillis();
-		dumpFrame();
+	if (_dumpInterval) {
+		if (g_system->getMillis() - _lastDump >= _dumpInterval) {
+			_lastDump = g_system->getMillis();
+			_dumpPending = false;
+			dumpFrame();
+		} else {
+			_dumpPending = true;
+		}
 	}
 }
 
@@ -916,6 +921,12 @@ void HdGfxDriver::tick() {
 	const uint32 now = g_system->getMillis();
 	Common::Rect dirty;
 	const Common::Rect screen(_virtualW, _virtualH);
+
+	if (_dumpPending && now - _lastDump >= _dumpInterval) {
+		_lastDump = now;
+		_dumpPending = false;
+		dumpFrame();
+	}
 
 	// Faces whose frame moved on, if the displayed frame holds them
 	if (!_hd->faces().empty()) {
@@ -999,6 +1010,10 @@ void HdGfxDriver::dumpFrame() {
 	f.close();
 	if (f.open(_dumpPath.appendComponent(Common::String::format("low-%04d.png", _dumpCount)), true))
 		Image::writePNG(f, low, _currentPalette, 256);
+	f.close();
+	// Written last, so a reader knows which dump is complete
+	if (f.open(_dumpPath.appendComponent("hd-last.txt"), true))
+		f.writeString(Common::String::format("%d\n", _dumpCount));
 	f.close();
 	_dumpCount++;
 #endif
