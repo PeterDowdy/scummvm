@@ -93,6 +93,7 @@ struct HdRecord {
 	int16 dstH;
 	bool mirror;
 	bool overlay; ///< an actor drawn as an overlay (see above): its pixels show the background
+	bool resampled; ///< drawn by the engine at a scale other than 1:1, so no pack can match it pixel for pixel
 	int16 face;   ///< a talker bust with a face.json: index into GfxHd's faces, else -1
 };
 
@@ -177,8 +178,9 @@ public:
 	 * Returns a record id (>= 1). Ids live in a ring: an id is only reused after 65535 newer draws, so ids
 	 * still held by the displayed frame, saved screen bits or transition backups stay valid.
 	 */
-	uint16 registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror, bool overlay = false);
+	uint16 registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror, bool overlay = false, bool resampled = false);
 	void setBackground(uint16 id) { _background = id; }
+	bool isResampled(uint16 id) const { return id && _records[id].resampled; }
 	bool isOverlay(uint16 id) const { return id && _records[id].overlay; }
 
 	// Faces (see above)

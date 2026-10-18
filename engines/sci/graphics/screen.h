@@ -167,10 +167,10 @@ public:
 	bool hdActive() const { return _hd != nullptr; }
 	/**
 	 * Following visual writes come from this view cel, whose full cel rect starts at left/top. ``celAx``/
-	 * ``celAy`` is the anchor inside the drawn cel; ``scaled`` draws are never overlays (see hd.h).
+	 * ``celAy`` is the anchor inside the drawn cel; ``scaled`` draws are never overlays (see hd.h); ``resampled`` marks a draw at a scale other than 1:1.
 	 */
 	void hdBeginView(int view, int loop, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH,
-		byte priority = 0, int16 celAx = 0, int16 celAy = 0, int cels = 0, bool scaled = false);
+		byte priority = 0, int16 celAx = 0, int16 celAy = 0, int cels = 0, bool scaled = false, bool resampled = false);
 	/** The cast object (actor) GfxAnimate is drawing, 0 for none: keys in-between tracking. */
 	void hdSetActor(uint32 actor) { _hdActor = actor; }
 	/** Called often from the event loop: lets the HD layer move in-between animation on. */

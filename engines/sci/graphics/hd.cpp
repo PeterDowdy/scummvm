@@ -77,7 +77,7 @@ GfxHd::GfxHd(const Common::FSNode &root, int scale) : _root(root), _scale(scale)
 	indexFiles(root, "");
 	_tweensEnabled = !ConfMan.hasKey("hd_tweens") || ConfMan.getBool("hd_tweens");
 	_facesEnabled = !ConfMan.hasKey("hd_faces") || ConfMan.getBool("hd_faces");
-	HdRecord none = { nullptr, 0, 0, 0, 0, false, false, -1 };
+	HdRecord none = { nullptr, 0, 0, 0, 0, false, false, false, -1 };
 	_records.resize(0x10000);
 	for (auto &r : _records)
 		r = none;
@@ -155,21 +155,21 @@ const HdImage *GfxHd::load(const Common::String &path, const Common::String &pal
 	return img;
 }
 
-uint16 GfxHd::registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror, bool overlay) {
+uint16 GfxHd::registerDraw(const HdImage *img, int16 left, int16 top, int16 dstW, int16 dstH, bool mirror, bool overlay, bool resampled) {
 	// Pack the draw into a key; images are identified by their record-independent address
 	const uint64 key = ((uint64)(uintptr)img << 32) ^ ((uint64)(uint16)left << 20) ^ ((uint64)(uint16)top << 8)
-		^ ((uint64)dstW << 40) ^ ((uint64)dstH << 52) ^ (mirror ? 1ULL << 63 : 0) ^ (overlay ? 1ULL << 62 : 0);
+		^ ((uint64)dstW << 40) ^ ((uint64)dstH << 52) ^ (mirror ? 1ULL << 63 : 0) ^ (overlay ? 1ULL << 62 : 0) ^ (resampled ? 1ULL << 61 : 0);
 	if (_recordIndex.contains(key)) {
 		const HdRecord &r = _records[_recordIndex[key]];
 		if (r.img == img && r.left == left && r.top == top && r.dstW == dstW && r.dstH == dstH && r.mirror == mirror
-				&& r.overlay == overlay)
+				&& r.overlay == overlay && r.resampled == resampled)
 			return _recordIndex[key];
 	}
 	const uint16 id = _nextRecord;
 	_nextRecord = _nextRecord == 0xFFFF ? 1 : _nextRecord + 1;
 	if (_records[id].img && _recordIndex.contains(_recordKeys[id]) && _recordIndex[_recordKeys[id]] == id)
 		_recordIndex.erase(_recordKeys[id]);
-	HdRecord r = { img, left, top, dstW, dstH, mirror, overlay, -1 };
+	HdRecord r = { img, left, top, dstW, dstH, mirror, overlay, resampled, -1 };
 	_records[id] = r;
 	_recordKeys[id] = key;
 	_recordIndex[key] = id;
@@ -1011,6 +1011,24 @@ void HdGfxDriver::dumpFrame() {
 	if (f.open(_dumpPath.appendComponent(Common::String::format("low-%04d.png", _dumpCount)), true))
 		Image::writePNG(f, low, _currentPalette, 256);
 	f.close();
+	// Low-res pixels the engine resampled (scaled actors): a nearest pack cannot match them block for block
+	bool anyResampled = false;
+	byte mask[320 * 200];
+	if ((uint)_virtualW * _virtualH <= sizeof(mask)) {
+		for (int i = 0; i < _virtualW * _virtualH; i++) {
+			mask[i] = _hd->isResampled(_currentProv[i]) ? 1 : 0;
+			anyResampled |= mask[i] != 0;
+		}
+	}
+	if (anyResampled) {
+		byte pal[256 * 3] = {};
+		pal[3] = pal[4] = pal[5] = 255;
+		Graphics::Surface m;
+		m.init(_virtualW, _virtualH, _virtualW, mask, Graphics::PixelFormat::createFormatCLUT8());
+		if (f.open(_dumpPath.appendComponent(Common::String::format("resampled-%04d.png", _dumpCount)), true))
+			Image::writePNG(f, m, pal, 256);
+		f.close();
+	}
 	// Written last, so a reader knows which dump is complete
 	if (f.open(_dumpPath.appendComponent("hd-last.txt"), true))
 		f.writeString(Common::String::format("%d\n", _dumpCount));

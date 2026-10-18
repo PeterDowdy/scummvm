@@ -236,7 +236,7 @@ GfxScreen::~GfxScreen() {
 }
 
 void GfxScreen::hdBeginView(int view, int loop, int cel, bool mirror, int16 left, int16 top, int16 dstW, int16 dstH,
-		byte priority, int16 celAx, int16 celAy, int cels, bool scaled) {
+		byte priority, int16 celAx, int16 celAy, int cels, bool scaled, bool resampled) {
 	_hdCurrent = 0;
 	if (!_hd || dstW <= 0 || dstH <= 0)
 		return;
@@ -250,7 +250,7 @@ void GfxScreen::hdBeginView(int view, int loop, int cel, bool mirror, int16 left
 	if (!img)
 		return;
 	const bool overlay = _hdActor && !scaled && _hd->hasTweens(view);
-	_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror, overlay);
+	_hdCurrent = _hd->registerDraw(img, left, top, dstW, dstH, mirror, overlay, resampled);
 	if (overlay) {
 		HdActor drawn;
 		drawn.view = view;

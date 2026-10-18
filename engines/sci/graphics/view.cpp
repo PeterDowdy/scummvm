@@ -900,7 +900,7 @@ void GfxView::drawScaled(const Common::Rect &rect, const Common::Rect &clipRect,
 		const LoopInfo &loop = _loop[CLIP<int16>(loopNo, 0, _loop.size() - 1)];
 		_screen->hdBeginView(_resourceId, loop.sourceLoop, CLIP<int16>(celNo, 0, loop.cel.size() - 1), loop.mirrorFlag,
 			clipRectTranslated.left - offsetX, clipRectTranslated.top - offsetY, (celWidth * scaleX) >> 7, (celHeight * scaleY) >> 7,
-			priority, 0, 0, loop.cel.size(), true);
+			priority, 0, 0, loop.cel.size(), true, (celWidth * scaleX) >> 7 != celWidth || (celHeight * scaleY) >> 7 != celHeight);
 	}
 	for (int y = 0; y < scaledHeight; y++) {
 		for (int x = 0; x < scaledWidth; x++) {
